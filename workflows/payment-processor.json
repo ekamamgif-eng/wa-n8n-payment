@@ -1,0 +1,578 @@
+{
+  "name": "WhatsApp Payment Proof Processor",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "whatsapp-webhook",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "webhook-trigger",
+      "name": "WhatsApp Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [250, 300],
+      "webhookId": "whatsapp-payment-webhook"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "string": [
+            {
+              "value1": "={{$json.entry[0].changes[0].value.messages[0].type}}",
+              "operation": "equals",
+              "value2": "image"
+            }
+          ]
+        }
+      },
+      "id": "check-message-type",
+      "name": "Check Message Type",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [450, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Extract WhatsApp message data\nconst webhookData = $input.all()[0].json;\nconst message = webhookData.entry[0].changes[0].value.messages[0];\nconst contact = webhookData.entry[0].changes[0].value.contacts[0];\n\nreturn {\n  json: {\n    from: message.from,\n    messageId: message.id,\n    timestamp: message.timestamp,\n    messageType: message.type,\n    mediaId: message.image?.id || message.document?.id,\n    mimeType: message.image?.mime_type || message.document?.mime_type,\n    caption: message.image?.caption || message.document?.caption || '',\n    contactName: contact.profile.name,\n    phoneNumber: message.from\n  }\n};"
+      },
+      "id": "extract-message-data",
+      "name": "Extract Message Data",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [650, 200]
+    },
+    {
+      "parameters": {
+        "authentication": "headerAuth",
+        "url": "=https://graph.facebook.com/v18.0/{{$env.WHATSAPP_PHONE_NUMBER_ID}}/media/{{$json.mediaId}}",
+        "options": {}
+      },
+      "id": "get-media-url",
+      "name": "Get Media URL",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [850, 200],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "whatsapp-api-auth",
+          "name": "WhatsApp API Auth"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "authentication": "headerAuth",
+        "url": "={{$json.url}}",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "file"
+            }
+          }
+        }
+      },
+      "id": "download-media",
+      "name": "Download Media",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [1050, 200],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "whatsapp-api-auth",
+          "name": "WhatsApp API Auth"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Validate file size and type\nconst item = $input.all()[0];\nconst binary = item.binary.data;\nconst maxSize = 5242880; // 5MB\nconst allowedTypes = ['image/jpeg', 'image/png', 'application/pdf'];\n\nif (binary.fileSize > maxSize) {\n  throw new Error('File terlalu besar. Maksimal 5MB.');\n}\n\nif (!allowedTypes.includes(binary.mimeType)) {\n  throw new Error('Tipe file tidak didukung. Gunakan JPG, PNG, atau PDF.');\n}\n\nreturn item;"
+      },
+      "id": "validate-file",
+      "name": "Validate File",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1250, 200]
+    },
+    {
+      "parameters": {
+        "model": "={{$env.OPENAI_MODEL || 'gpt-4o-mini'}}",
+        "messages": {
+          "values": [
+            {
+              "content": "=Anda adalah asisten pembayaran yang ahli dalam membaca bukti transfer.\n\nAnalisis gambar bukti pembayaran ini dan ekstrak informasi berikut dalam format JSON:\n\n{\n  \"nama_pengirim\": \"nama lengkap pengirim\",\n  \"nominal\": jumlah_dalam_angka,\n  \"tanggal_transaksi\": \"YYYY-MM-DD\",\n  \"metode_pembayaran\": \"nama bank/metode\",\n  \"nomor_referensi\": \"nomor referensi jika ada\",\n  \"confidence\": \"high/medium/low\"\n}\n\nJika informasi tidak dapat dibaca dengan jelas, gunakan null untuk field tersebut.\nBerikan confidence level berdasarkan kejelasan gambar.",
+              "role": "system"
+            },
+            {
+              "content": "={{[\n  {\n    type: 'text',\n    text: 'Baca bukti pembayaran ini dan ekstrak datanya.'\n  },\n  {\n    type: 'image_url',\n    image_url: {\n      url: 'data:' + $binary.data.mimeType + ';base64,' + $binary.data.data\n    }\n  }\n]}}",
+              "role": "user"
+            }
+          ]
+        },
+        "options": {
+          "temperature": 0.1,
+          "maxTokens": 500
+        },
+        "responseFormat": "json_object"
+      },
+      "id": "ai-ocr-extraction",
+      "name": "AI OCR Extraction",
+      "type": "@n8n/n8n-nodes-langchain.openAi",
+      "typeVersion": 1.3,
+      "position": [1450, 200],
+      "credentials": {
+        "openAiApi": {
+          "id": "openai-credentials",
+          "name": "OpenAI API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parse and validate extracted data\nconst aiResponse = JSON.parse($json.choices[0].message.content);\nconst originalData = $('Extract Message Data').item.json;\n\n// Validation rules\nconst errors = [];\n\nif (!aiResponse.nominal || aiResponse.nominal <= 0) {\n  errors.push('Nominal tidak valid atau tidak terbaca');\n}\n\nif (!aiResponse.tanggal_transaksi) {\n  errors.push('Tanggal transaksi tidak terbaca');\n}\n\nif (!aiResponse.nama_pengirim) {\n  errors.push('Nama pengirim tidak terbaca');\n}\n\nif (aiResponse.confidence === 'low') {\n  errors.push('Kualitas gambar kurang jelas');\n}\n\nreturn {\n  json: {\n    ...aiResponse,\n    phoneNumber: originalData.phoneNumber,\n    contactName: originalData.contactName,\n    messageId: originalData.messageId,\n    timestamp: new Date().toISOString(),\n    status: errors.length > 0 ? 'GAGAL_VALIDASI' : 'MENUNGGU_VERIFIKASI',\n    errors: errors,\n    isValid: errors.length === 0\n  }\n};"
+      },
+      "id": "validate-data",
+      "name": "Validate Data",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1650, 200]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            {
+              "value1": "={{$json.isValid}}",
+              "value2": true
+            }
+          ]
+        }
+      },
+      "id": "check-validation",
+      "name": "Check Validation",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [1850, 200]
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": "={{$env.GOOGLE_SHEETS_SPREADSHEET_ID}}",
+        "sheetName": "Pembayaran",
+        "columns": {
+          "mappings": [
+            {
+              "column": "Timestamp",
+              "value": "={{$json.timestamp}}"
+            },
+            {
+              "column": "Nomor WhatsApp",
+              "value": "={{$json.phoneNumber}}"
+            },
+            {
+              "column": "Nama Kontak",
+              "value": "={{$json.contactName}}"
+            },
+            {
+              "column": "Nama Pengirim",
+              "value": "={{$json.nama_pengirim}}"
+            },
+            {
+              "column": "Nominal",
+              "value": "={{$json.nominal}}"
+            },
+            {
+              "column": "Tanggal Transaksi",
+              "value": "={{$json.tanggal_transaksi}}"
+            },
+            {
+              "column": "Metode Pembayaran",
+              "value": "={{$json.metode_pembayaran}}"
+            },
+            {
+              "column": "Nomor Referensi",
+              "value": "={{$json.nomor_referensi}}"
+            },
+            {
+              "column": "Status",
+              "value": "={{$json.status}}"
+            },
+            {
+              "column": "Confidence",
+              "value": "={{$json.confidence}}"
+            },
+            {
+              "column": "Message ID",
+              "value": "={{$json.messageId}}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "save-to-sheets",
+      "name": "Save to Google Sheets",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4,
+      "position": [2050, 100],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "google-sheets-oauth",
+          "name": "Google Sheets OAuth2"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "authentication": "headerAuth",
+        "method": "POST",
+        "url": "=https://graph.facebook.com/v18.0/{{$env.WHATSAPP_PHONE_NUMBER_ID}}/messages",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "messaging_product",
+              "value": "whatsapp"
+            },
+            {
+              "name": "to",
+              "value": "={{$json.phoneNumber}}"
+            },
+            {
+              "name": "type",
+              "value": "text"
+            },
+            {
+              "name": "text",
+              "value": "={\"body\": \"✅ *Bukti Pembayaran Diterima*\\n\\nTerima kasih, {{$json.contactName}} 🙏\\n\\nBukti pembayaran Anda sudah kami terima dengan detail:\\n\\n💰 *Nominal:* Rp {{$json.nominal.toLocaleString('id-ID')}}\\n📅 *Tanggal:* {{$json.tanggal_transaksi}}\\n🏦 *Metode:* {{$json.metode_pembayaran}}\\n👤 *Pengirim:* {{$json.nama_pengirim}}\\n\\n📋 *Status:* Menunggu verifikasi\\n\\nTim kami akan segera memverifikasi pembayaran Anda. Terima kasih atas kesabaran Anda.\"}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "send-success-reply",
+      "name": "Send Success Reply",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [2250, 100],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "whatsapp-api-auth",
+          "name": "WhatsApp API Auth"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": "={{$env.GOOGLE_SHEETS_SPREADSHEET_ID}}",
+        "sheetName": "Gagal Validasi",
+        "columns": {
+          "mappings": [
+            {
+              "column": "Timestamp",
+              "value": "={{$json.timestamp}}"
+            },
+            {
+              "column": "Nomor WhatsApp",
+              "value": "={{$json.phoneNumber}}"
+            },
+            {
+              "column": "Nama Kontak",
+              "value": "={{$json.contactName}}"
+            },
+            {
+              "column": "Errors",
+              "value": "={{$json.errors.join(', ')}}"
+            },
+            {
+              "column": "Message ID",
+              "value": "={{$json.messageId}}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "save-failed-to-sheets",
+      "name": "Save Failed to Sheets",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4,
+      "position": [2050, 300],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "google-sheets-oauth",
+          "name": "Google Sheets OAuth2"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "authentication": "headerAuth",
+        "method": "POST",
+        "url": "=https://graph.facebook.com/v18.0/{{$env.WHATSAPP_PHONE_NUMBER_ID}}/messages",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "messaging_product",
+              "value": "whatsapp"
+            },
+            {
+              "name": "to",
+              "value": "={{$json.phoneNumber}}"
+            },
+            {
+              "name": "type",
+              "value": "text"
+            },
+            {
+              "name": "text",
+              "value": "={\"body\": \"❌ *Bukti Pembayaran Tidak Dapat Dibaca*\\n\\nMohon maaf, {{$json.contactName}}\\n\\nBukti pembayaran yang Anda kirim tidak dapat kami proses karena:\\n\\n\" + $json.errors.map((e, i) => `${i+1}. ${e}`).join('\\n') + \"\\n\\n📸 *Saran:*\\n• Pastikan foto jelas dan tidak blur\\n• Pastikan semua informasi terlihat\\n• Gunakan pencahayaan yang cukup\\n• Format: JPG, PNG, atau PDF (max 5MB)\\n\\nSilakan kirim ulang bukti pembayaran Anda. Terima kasih.\"}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "send-error-reply",
+      "name": "Send Error Reply",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [2250, 300],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "whatsapp-api-auth",
+          "name": "WhatsApp API Auth"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "=OK"
+      },
+      "id": "webhook-response",
+      "name": "Webhook Response",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [2450, 200]
+    },
+    {
+      "parameters": {
+        "authentication": "headerAuth",
+        "method": "POST",
+        "url": "=https://graph.facebook.com/v18.0/{{$env.WHATSAPP_PHONE_NUMBER_ID}}/messages",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "messaging_product",
+              "value": "whatsapp"
+            },
+            {
+              "name": "to",
+              "value": "={{$json.from}}"
+            },
+            {
+              "name": "type",
+              "value": "text"
+            },
+            {
+              "name": "text",
+              "value": "{\"body\": \"Mohon maaf, sistem ini hanya menerima bukti pembayaran dalam bentuk gambar atau dokumen PDF.\\n\\nSilakan kirim foto atau file bukti transfer Anda.\"}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "send-invalid-type-reply",
+      "name": "Send Invalid Type Reply",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [650, 400],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "whatsapp-api-auth",
+          "name": "WhatsApp API Auth"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "WhatsApp Webhook": {
+      "main": [
+        [
+          {
+            "node": "Check Message Type",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Message Type": {
+      "main": [
+        [
+          {
+            "node": "Extract Message Data",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Send Invalid Type Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract Message Data": {
+      "main": [
+        [
+          {
+            "node": "Get Media URL",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Media URL": {
+      "main": [
+        [
+          {
+            "node": "Download Media",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Download Media": {
+      "main": [
+        [
+          {
+            "node": "Validate File",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate File": {
+      "main": [
+        [
+          {
+            "node": "AI OCR Extraction",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI OCR Extraction": {
+      "main": [
+        [
+          {
+            "node": "Validate Data",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate Data": {
+      "main": [
+        [
+          {
+            "node": "Check Validation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Validation": {
+      "main": [
+        [
+          {
+            "node": "Save to Google Sheets",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Save Failed to Sheets",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save to Google Sheets": {
+      "main": [
+        [
+          {
+            "node": "Send Success Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Success Reply": {
+      "main": [
+        [
+          {
+            "node": "Webhook Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save Failed to Sheets": {
+      "main": [
+        [
+          {
+            "node": "Send Error Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Error Reply": {
+      "main": [
+        [
+          {
+            "node": "Webhook Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Invalid Type Reply": {
+      "main": [
+        [
+          {
+            "node": "Webhook Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "staticData": null,
+  "tags": [],
+  "triggerCount": 1,
+  "updatedAt": "2025-12-15T02:19:29.000Z",
+  "versionId": "1"
+}
